@@ -11,21 +11,9 @@ function Set-CIPPIntunePolicy {
         $APINAME,
         $tenantFilter
     )
-    #connect to table, get replacement map. This is for future usage. The replacement map will allow users to create custom vars that get replaced by the actual values per tenant. Example:
-    # %WallPaperPath% gets replaced by RowKey WallPaperPath which is set to C:\Wallpapers for tenant 1, and D:\Wallpapers for tenant 2
-    $ReplaceTable = Get-CIPPTable -tablename 'CippReplacemap'
-    $ReplaceMap = Get-CIPPAzDataTableEntity @ReplaceTable -Filter "PartitionKey eq '$tenantFilter'"
-    if ($ReplaceMap) {
-        foreach ($Replace in $ReplaceMap) {
-            $RawJSON = $RawJSON -replace $Replace.RowKey, $Replace.Value
-        }
-    }
-    #default replacements for all tenants: %tenantid% becomes $tenant.customerId, %tenantfilter% becomes $tenant.defaultDomainName, %tenantname% becomes $tenant.displayName
-    $Tenant = Get-Tenants -TenantFilter $tenantFilter
-    $RawJSON = $RawJSON -replace '%tenantid%', $Tenant.customerId
-    $RawJSON = $RawJSON -replace '%tenantfilter%', $Tenant.defaultDomainName
-    $RawJSON = $RawJSON -replace '%tenantname%', $Tenant.displayName
+    $APINAME = 'Set-CIPPIntunePolicy'
 
+    $RawJSON = Get-CIPPTextReplacement -TenantFilter $tenantFilter -Text $RawJSON
 
     try {
         switch ($TemplateType) {
@@ -35,6 +23,7 @@ function Set-CIPPIntunePolicy {
                 $PolicyFile = $RawJSON | ConvertFrom-Json
                 $Null = $PolicyFile | Add-Member -MemberType NoteProperty -Name 'description' -Value $description -Force
                 $null = $PolicyFile | Add-Member -MemberType NoteProperty -Name 'displayName' -Value $displayname -Force
+                $PolicyFile = $PolicyFile | Select-Object * -ExcludeProperty 'apps'
                 $RawJSON = ConvertTo-Json -InputObject $PolicyFile -Depth 20
                 $TemplateTypeURL = if ($TemplateType -eq 'windowsInformationProtectionPolicy') { 'windowsInformationProtectionPolicies' } else { "$($TemplateType)s" }
                 $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter
@@ -77,8 +66,8 @@ function Set-CIPPIntunePolicy {
                     $ExistingID = $CheckExististing | Where-Object -Property displayName -EQ $displayname
                     $ExistingData = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$($ExistingID.id)')/definitionValues" -tenantid $tenantFilter
                     $DeleteJson = $RawJSON | ConvertFrom-Json -Depth 10
-                    $DeleteJson.deletedIds = @($ExistingData.id)
-                    $DeleteJson.added = @()
+                    $DeleteJson | Add-Member -MemberType NoteProperty -Name 'deletedIds' -Value @($ExistingData.id) -Force
+                    $DeleteJson | Add-Member -MemberType NoteProperty -Name 'added' -Value @() -Force
                     $DeleteJson = ConvertTo-Json -Depth 10 -InputObject $DeleteJson
                     $DeleteRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$($ExistingID.id)')/updateDefinitionValues" -tenantid $tenantFilter -type POST -body $DeleteJson
                     $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$($ExistingID.id)')/updateDefinitionValues" -tenantid $tenantFilter -type POST -body $RawJSON
@@ -120,6 +109,40 @@ function Set-CIPPIntunePolicy {
                 $PlatformType = 'deviceManagement'
                 $TemplateTypeURL = 'configurationPolicies'
                 $DisplayName = ($RawJSON | ConvertFrom-Json).Name
+
+                $Template = $RawJSON | ConvertFrom-Json
+                if ($Template.templateReference.templateId) {
+                    Write-Information "Checking configuration policy template $($Template.templateReference.templateId) for $($DisplayName)"
+                    # Remove unavailable settings from the template
+                    $AvailableSettings = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/deviceManagement/configurationPolicyTemplates('$($Template.templateReference.templateId)')/settingTemplates?`$expand=settingDefinitions&`$top=1000" -tenantid $tenantFilter
+
+                    if ($AvailableSettings) {
+                        Write-Information "Available settings for template $($Template.templateReference.templateId): $($AvailableSettings.Count)"
+                        $FilteredSettings = [system.collections.generic.list[psobject]]::new()
+                        foreach ($setting in $Template.settings) {
+                            if ($setting.settingInstance.settingInstanceTemplateReference.settingInstanceTemplateId -in $AvailableSettings.settingInstanceTemplate.settingInstanceTemplateId) {
+                                $AvailableSetting = $AvailableSettings | Where-Object { $_.settingInstanceTemplate.settingInstanceTemplateId -eq $setting.settingInstance.settingInstanceTemplateReference.settingInstanceTemplateId }
+
+                                if ($AvailableSetting.settingInstanceTemplate.settingInstanceTemplateId -cnotmatch $setting.settingInstance.settingInstanceTemplateReference.settingInstanceTemplateId) {
+                                    # update casing
+                                    Write-Information "Fixing casing for setting instance template $($AvailableSetting.settingInstanceTemplate.settingInstanceTemplateId)"
+                                    $setting.settingInstance.settingInstanceTemplateReference.settingInstanceTemplateId = $AvailableSetting.settingInstanceTemplate.settingInstanceTemplateId
+                                }
+
+                                if ($AvailableSetting.settingInstanceTemplate.choiceSettingValueTemplate -cnotmatch $setting.settingInstance.choiceSettingValue.settingValueTemplateReference.settingValueTemplateId) {
+                                    # update choice setting value template
+                                    Write-Information "Fixing casing for choice setting value template $($AvailableSetting.settingInstanceTemplate.choiceSettingValueTemplate.settingValueTemplateId)"
+                                    $setting.settingInstance.choiceSettingValue.settingValueTemplateReference.settingValueTemplateId = $AvailableSetting.settingInstanceTemplate.choiceSettingValueTemplate.settingValueTemplateId
+                                }
+
+                                $FilteredSettings.Add($setting)
+                            }
+                        }
+                        $Template.settings = $FilteredSettings
+                        $RawJSON = $Template | ConvertTo-Json -Depth 100 -Compress
+                    }
+                }
+
                 $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter
                 if ($DisplayName -in $CheckExististing.name) {
                     $PolicyFile = $RawJSON | ConvertFrom-Json | Select-Object * -ExcludeProperty Platform, PolicyType, CreationSource
